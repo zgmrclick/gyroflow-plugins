@@ -125,38 +125,38 @@ impl CurrentFileInfo {
 }
 
 /// Parts of the source clips that are used on the current Resolve timeline, queried with fuscript.
-/// One query returns all timeline items, so it's shared by all plugin instances and refreshed in the background.
+/// One query returns all timeline items, so it's shared by all plugin instances.
 pub struct TimelineRanges;
 
 type RangesByFile = std::collections::HashMap<String, Vec<(f64, f64)>>;
 static TIMELINE_RANGES: Mutex<Option<(std::time::Instant, RangesByFile)>> = Mutex::new(None);
-static TIMELINE_RANGES_QUERYING: AtomicBool = AtomicBool::new(false);
+static TIMELINE_RANGES_LAST_USE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 impl TimelineRanges {
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Pause in rendering after which the ranges may be refreshed. Don't query during continuous playback,
+    /// only when the user may have changed the timeline
+    const IDLE_BEFORE_REFRESH: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Source frame range `[start, end)` of the timeline item that uses `file_path` at `frame`.
     /// When the file is used multiple times, returns the item containing `frame`, or the closest one.
     pub fn range_at(file_path: &str, frame: f64) -> Option<(f64, f64)> {
         if !CurrentFileInfo::is_available() { return None; }
 
+        let idle = TIMELINE_RANGES_LAST_USE.lock().replace(std::time::Instant::now())
+            .map_or(true, |last_use| last_use.elapsed() > Self::IDLE_BEFORE_REFRESH);
+
+        // Query synchronously, so the rendered frames always use the current range. It only runs on the first
+        // render and after a pause in rendering (eg. after trimming a clip), never during playback
         let mut lock = TIMELINE_RANGES.lock();
-        match lock.as_ref() {
-            // Query synchronously the first time, so the first rendered frames already use the right zoom
-            None => { *lock = Some((std::time::Instant::now(), Self::query().unwrap_or_default())); },
-            Some((queried_at, _)) if queried_at.elapsed() > Self::REFRESH_INTERVAL && !TIMELINE_RANGES_QUERYING.swap(true, SeqCst) => {
-                std::thread::spawn(|| {
-                    let ranges = Self::query();
-                    let mut lock = TIMELINE_RANGES.lock();
-                    if let Some(ranges) = ranges {
-                        *lock = Some((std::time::Instant::now(), ranges));
-                    } else if let Some((queried_at, _)) = lock.as_mut() {
-                        *queried_at = std::time::Instant::now();
-                    }
-                    TIMELINE_RANGES_QUERYING.store(false, SeqCst);
-                });
-            },
-            _ => { }
+        let stale = lock.as_ref().map_or(true, |(queried_at, _)| idle && queried_at.elapsed() > Self::REFRESH_INTERVAL);
+        if stale {
+            let ranges = Self::query();
+            if ranges.is_some() || lock.is_none() {
+                *lock = Some((std::time::Instant::now(), ranges.unwrap_or_default()));
+            } else if let Some((queried_at, _)) = lock.as_mut() {
+                *queried_at = std::time::Instant::now();
+            }
         }
 
         let distance = |(start, end): &(f64, f64)| if frame < *start { *start - frame } else if frame >= *end { frame - *end + 1.0 } else { 0.0 };
