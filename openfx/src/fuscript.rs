@@ -123,3 +123,83 @@ impl CurrentFileInfo {
         }
     }
 }
+
+/// Parts of the source clips that are used on the current Resolve timeline, queried with fuscript.
+/// One query returns all timeline items, so it's shared by all plugin instances and refreshed in the background.
+pub struct TimelineRanges;
+
+type RangesByFile = std::collections::HashMap<String, Vec<(f64, f64)>>;
+static TIMELINE_RANGES: Mutex<Option<(std::time::Instant, RangesByFile)>> = Mutex::new(None);
+static TIMELINE_RANGES_QUERYING: AtomicBool = AtomicBool::new(false);
+
+impl TimelineRanges {
+    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Source frame range `[start, end)` of the timeline item that uses `file_path` at `frame`.
+    /// When the file is used multiple times, returns the item containing `frame`, or the closest one.
+    pub fn range_at(file_path: &str, frame: f64) -> Option<(f64, f64)> {
+        if !CurrentFileInfo::is_available() { return None; }
+
+        let mut lock = TIMELINE_RANGES.lock();
+        match lock.as_ref() {
+            // Query synchronously the first time, so the first rendered frames already use the right zoom
+            None => { *lock = Some((std::time::Instant::now(), Self::query().unwrap_or_default())); },
+            Some((queried_at, _)) if queried_at.elapsed() > Self::REFRESH_INTERVAL && !TIMELINE_RANGES_QUERYING.swap(true, SeqCst) => {
+                std::thread::spawn(|| {
+                    let ranges = Self::query();
+                    let mut lock = TIMELINE_RANGES.lock();
+                    if let Some(ranges) = ranges {
+                        *lock = Some((std::time::Instant::now(), ranges));
+                    } else if let Some((queried_at, _)) = lock.as_mut() {
+                        *queried_at = std::time::Instant::now();
+                    }
+                    TIMELINE_RANGES_QUERYING.store(false, SeqCst);
+                });
+            },
+            _ => { }
+        }
+
+        let distance = |(start, end): &(f64, f64)| if frame < *start { *start - frame } else if frame >= *end { frame - *end + 1.0 } else { 0.0 };
+        lock.as_ref()?.1.get(file_path)?.iter().copied().min_by(|a, b| distance(a).total_cmp(&distance(b)))
+    }
+
+    fn query() -> Option<RangesByFile> {
+        let mut cmd = std::process::Command::new(CurrentFileInfo::get_fuscript()?);
+        #[cfg(target_os = "windows")]
+        { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); } // CREATE_NO_WINDOW
+
+        // Source end frame isn't consistently inclusive or exclusive, so treat it as inclusive, one extra frame doesn't matter
+        let script = r#"local tl = Resolve():GetProjectManager():GetCurrentProject():GetCurrentTimeline()
+            print("timeline")
+            for t = 1, tl:GetTrackCount("video") do
+                for _, item in ipairs(tl:GetItemListInTrack("video", t) or {}) do
+                    pcall(function()
+                        local mpi = item:GetMediaPoolItem()
+                        if mpi then
+                            local ok, s, e = pcall(function() return item:GetSourceStartFrame(), item:GetSourceEndFrame() end)
+                            if not ok or s == nil or e == nil then
+                                s = item:GetLeftOffset()
+                                e = s + item:GetDuration() - 1
+                            end
+                            print(s .. "\t" .. e .. "\t" .. mpi:GetClipProperty("File Path"))
+                        end
+                    end)
+                end
+            end"#;
+        let out = cmd.args(["-q", "-l", "lua", "-x", script]).output().ok()?;
+        let stdout = String::from_utf8(out.stdout).ok()?;
+        let mut lines = stdout.lines().map(str::trim);
+        if lines.next() != Some("timeline") {
+            log::debug!("fuscript timeline query failed: {stdout} {}", String::from_utf8_lossy(&out.stderr));
+            return None;
+        }
+        let mut ranges = RangesByFile::new();
+        for line in lines {
+            let mut parts = line.splitn(3, '\t');
+            if let (Some(Ok(start)), Some(Ok(end)), Some(path)) = (parts.next().map(str::parse::<f64>), parts.next().map(str::parse::<f64>), parts.next()) {
+                ranges.entry(replace_frame_count(path)).or_default().push((start.floor(), end.ceil() + 1.0));
+            }
+        }
+        Some(ranges)
+    }
+}
